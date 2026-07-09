@@ -14,7 +14,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_feed import fetch_all_tickers, fetch_bundles_threaded, get_top_symbols_by_volume
+from data_feed import (
+    fetch_all_tickers, 
+    fetch_bundles_threaded, 
+    fetch_bundles_batched,
+    get_top_symbols_by_volume
+)
 from indicators import (
     ZONE_COLORS, SIGNAL_COLORS, composite_oracle, gmma_signal, pivot_zone,
     williams_r, macd, crt, smc, vwap, rvol, normalize_signal, get_signal_color
@@ -165,7 +170,8 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     if universe_mode == "Top by 24h Volume":
-        top_n = st.slider("Number of symbols", 10, 80, 30, step=5)
+        top_n = st.slider("Number of symbols", 10, 500, 100, step=10, 
+                          help="Scan top N symbols by 24h volume. Max 500 symbols supported.")
         custom_symbols = None
     else:
         default_watchlist = "BTC/USDT, ETH/USDT, SOL/USDT, BNB/USDT, XRP/USDT, DOGE/USDT"
@@ -174,7 +180,8 @@ with st.sidebar:
         top_n = None
 
     min_volume = st.number_input(
-        "Min 24h volume (USDT)", min_value=0, value=1_000_000, step=100_000, format="%d"
+        "Min 24h volume (USDT)", min_value=0, value=1_000_000, step=100_000, format="%d",
+        help="Filter out low-volume pairs to improve performance"
     )
 
     st.markdown("---")
@@ -233,7 +240,11 @@ def build_master_table(symbols: tuple, min_volume: float) -> pd.DataFrame:
         norm = raw_sym[:-5] if raw_sym.endswith(":USDT") else raw_sym
         ticker_lookup[norm] = data
 
-    bundles = fetch_bundles_threaded(list(symbols))
+    # Use batching for large symbol sets to avoid timeouts
+    if len(symbols) > 200:
+        bundles = fetch_bundles_batched(list(symbols), batch_size=200, max_workers=16)
+    else:
+        bundles = fetch_bundles_threaded(list(symbols), max_workers=16)
 
     rows = []
     for sym in symbols:
@@ -341,7 +352,14 @@ with st.spinner("Scanning Binance Futures market..."):
     else:
         symbols = custom_symbols or []
 
-    df = build_master_table(tuple(symbols), float(min_volume)) if symbols else pd.DataFrame()
+    if symbols:
+        total_symbols = len(symbols)
+        if total_symbols > 200:
+            st.info(f"🔍 Scanning {total_symbols} symbols in batches. This may take 30-60 seconds for large scans.")
+        
+        df = build_master_table(tuple(symbols), float(min_volume)) if symbols else pd.DataFrame()
+    else:
+        df = pd.DataFrame()
 
 if df.empty:
     st.warning(
@@ -362,6 +380,7 @@ strong_bull = int((df["HVTS_Score"] >= 0.5).sum())
 strong_bear = int((df["HVTS_Score"] <= -0.5).sum())
 deep_value = int(df["Zone"].isin(["Accumulation Zone", "Extreme Discount"]).sum())
 avg_conf = df[["Day_Conf", "Swing_Conf", "Position_Conf"]].mean().mean()
+market_coverage = (total_syms / 500) * 100 if total_syms > 0 else 0
 
 kpis = [
     ("Symbols Scanned", f"{total_syms}", CYAN),
@@ -369,6 +388,7 @@ kpis = [
     ("Strong Bearish", f"{strong_bear}", RED),
     ("Deep-Value Zone", f"{deep_value}", GOLD),
     ("Avg Confidence", f"{avg_conf:.0f}%", PURPLE),
+    ("Market Coverage", f"{market_coverage:.0f}%", CYAN),
 ]
 cards_html = '<div class="kpi-row">'
 for label, value, color in kpis:
