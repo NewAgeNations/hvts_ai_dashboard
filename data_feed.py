@@ -1,184 +1,183 @@
 """
-HVTS.AI Studio - Public Data Feed
-=================================
-Reads ONLY public Binance Futures market data via ccxt (no API keys).
-Optimized for large symbol sets (500+ symbols) with batching and thread pooling.
+HVTS.AI Studio - Public Data Feed (Yahoo Finance)
+==================================================
+Free, no‑API‑key OHLCV data from Yahoo Finance for crypto pairs.
+Replaces Binance Futures data.
 """
 
-import time
 import pandas as pd
 import streamlit as st
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
-import ccxt
+import yfinance as yf
 
-EXCLUDED_QUOTE_ASSETS = {
-    "USDC", "TUSD", "BUSD", "DAI", "USDP", "FDUSD", "AEUR",
-    "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "CNH", "NZD",
-    "ZAR", "TRY", "BRL", "MXN", "SGD", "HKD", "KRW", "RUB",
-    "UAH", "PLN", "CZK", "SEK", "NOK", "DKK", "ILS", "NGN",
-    "PHP", "IDR", "INR", "VND",
+# ============================================================================
+# SYMBOL MAPPING (Internal -> Yahoo Ticker)
+# ============================================================================
+# Maps our internal symbol names to Yahoo Finance tickers.
+# For POL (Polygon), Yahoo still uses MATIC-USD.
+SYMBOL_MAP = {
+    "BTC/USDT": "BTC-USD",
+    "ETH/USDT": "ETH-USD",
+    "TRX/USDT": "TRX-USD",
+    "XRP/USDT": "XRP-USD",
+    "ADA/USDT": "ADA-USD",
+    "DOGE/USDT": "DOGE-USD",
+    "POL/USDT": "MATIC-USD",      # Polygon (formerly MATIC)
+    "DOT/USDT": "DOT-USD",
+    "AVAX/USDT": "AVAX-USD",
+    "BNB/USDT": "BNB-USD",
+}
+
+# Yahoo Finance interval strings for each timeframe
+YF_INTERVALS = {
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "1h",
+    "4h": "1h",      # We'll resample 1h -> 4h
+    "1d": "1d",
+    "1w": "1wk",
 }
 
 
-def get_exchange():
+def _to_yahoo_symbol(symbol: str) -> str:
     """
-    Initialize and return Binance USDT-M perpetual futures exchange object.
-    No API keys required - public endpoints only.
+    Convert our internal symbol (e.g., 'BTC/USDT') to a Yahoo Finance ticker.
+    If not found in the map, fallback to replacing '/' with '-'.
     """
-    return ccxt.binanceusdm({
-        "enableRateLimit": True,
-        "timeout": 20000,
-        "apiKey": "",
-        "secret": "",
-    })
-
-
-def normalize_symbol(symbol: str) -> str:
-    """
-    Normalize symbol string by removing :USDT suffix if present.
-    
-    Args:
-        symbol: Raw symbol string (e.g., "BTC/USDT:USDT" or "BTC/USDT")
-    
-    Returns:
-        Normalized symbol (e.g., "BTC/USDT")
-    """
-    if symbol.endswith(":USDT"):
-        return symbol[:-5]
-    return symbol
-
-
-def is_excluded(symbol: str) -> bool:
-    """
-    Check if a symbol should be excluded based on quote asset.
-    
-    Args:
-        symbol: Symbol string to check
-    
-    Returns:
-        True if symbol should be excluded, False otherwise
-    """
-    base = normalize_symbol(symbol).split("/")[0]
-    return base in EXCLUDED_QUOTE_ASSETS
-
-
-@st.cache_data(ttl=90, show_spinner=False)
-def fetch_all_tickers() -> Dict[str, Dict]:
-    """
-    Fetch all tickers from Binance Futures and filter for USDT pairs only.
-    Cached for 90 seconds to reduce API calls.
-    
-    Returns:
-        Dictionary of ticker data keyed by symbol
-    """
-    ex = get_exchange()
-    try:
-        tickers = ex.fetch_tickers()
-        # Filter to only USDT pairs and exclude problematic symbols
-        filtered = {}
-        for k, v in tickers.items():
-            if "/USDT" in k and not is_excluded(k):
-                filtered[k] = v
-        return filtered
-    except Exception as e:
-        st.error(f"Error fetching tickers: {e}")
-        return {}
+    return SYMBOL_MAP.get(symbol, symbol.replace("/", "-"))
 
 
 @st.cache_data(ttl=280, show_spinner=False)
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300) -> Optional[pd.DataFrame]:
     """
-    Fetch OHLCV data for a symbol and timeframe.
-    Cached for 280 seconds to balance freshness and performance.
+    Fetch OHLCV data from Yahoo Finance.
     
     Args:
-        symbol: Trading pair (e.g., "BTC/USDT")
-        timeframe: Timeframe string (e.g., "1h", "4h", "1d")
-        limit: Number of candles to fetch
+        symbol: Internal symbol (e.g., 'BTC/USDT')
+        timeframe: One of '15m', '30m', '1h', '4h', '1d', '1w'
+        limit: Number of candles to return
     
     Returns:
-        DataFrame with OHLCV data or None if fetch fails
+        DataFrame with columns: open, high, low, close, volume
+        Index: timestamp (datetime)
+        Returns None if fetch fails or data is empty.
     """
-    ex = get_exchange()
+    yf_symbol = _to_yahoo_symbol(symbol)
+    interval = YF_INTERVALS.get(timeframe, "1h")
+
+    # For 4h we need more 1h candles to resample
+    if timeframe == "4h":
+        fetch_limit = limit * 4 + 10   # extra buffer
+    else:
+        fetch_limit = limit
+
+    # Determine how many days of history to fetch
+    # This helps avoid downloading excessive data
+    if interval in ["15m", "30m", "1h"]:
+        # estimate minutes per candle
+        if interval == "15m":
+            minutes = 15
+        elif interval == "30m":
+            minutes = 30
+        else:  # 1h
+            minutes = 60
+        total_minutes = fetch_limit * minutes + 200
+        days = total_minutes / (24 * 60)
+        period = f"{int(days) + 2}d"
+    elif interval == "1d":
+        period = f"{fetch_limit + 14}d"
+    elif interval == "1wk":
+        period = f"{fetch_limit * 7 + 30}d"
+    else:
+        period = "max"  # fallback
+
     try:
-        ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
-        if not ohlcv or len(ohlcv) < 5:
+        ticker = yf.Ticker(yf_symbol)
+        df = ticker.history(period=period, interval=interval)
+
+        if df.empty:
             return None
-        
-        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        df.set_index("timestamp", inplace=True)
+
+        # Normalise column names to lowercase
+        df.columns = [c.lower() for c in df.columns]
+
+        # Ensure volume column exists
+        if 'volume' not in df.columns:
+            df['volume'] = 0
+
+        # For 4h, resample from 1h
+        if timeframe == "4h":
+            # Resample using 4-hour offset
+            df_resampled = df.resample('4H').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).dropna()
+            df = df_resampled
+
+        # Keep only the last 'limit' candles
+        df = df.iloc[-limit:]
+
+        # Reset index to make timestamp a column, then set it back as index
+        # This ensures the index is a proper datetime index
+        if df.index.name is None or df.index.name == '':
+            df.index.name = 'timestamp'
+        df = df.reset_index()
+        if 'date' in df.columns:
+            df = df.rename(columns={'date': 'timestamp'})
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df.set_index('timestamp', inplace=True)
+
+        # Drop any rows with NaN
+        df = df.dropna()
+
+        if df.empty:
+            return None
+
         return df
-    except Exception:
+
+    except Exception as e:
+        # Silently fail – the caller will handle None
+        print(f"Error fetching {yf_symbol} {timeframe}: {e}")
         return None
-
-
-def get_top_symbols_by_volume(tickers: Dict[str, Dict], min_volume: float, top_n: int) -> List[str]:
-    """
-    Get top N symbols by 24h volume with optimized filtering.
-    Supports up to 500+ symbols efficiently.
-    
-    Args:
-        tickers: Dictionary of ticker data
-        min_volume: Minimum 24h volume threshold
-        top_n: Number of top symbols to return
-    
-    Returns:
-        List of normalized symbol strings
-    """
-    rows = []
-    for raw_symbol, data in tickers.items():
-        if "/USDT" not in raw_symbol or is_excluded(raw_symbol):
-            continue
-        
-        vol = data.get("quoteVolume", 0) or 0
-        if vol >= min_volume:
-            rows.append((raw_symbol, vol))
-    
-    # Sort by volume descending and limit
-    rows.sort(key=lambda r: -r[1])
-    return [normalize_symbol(r[0]) for r in rows[:top_n]]
 
 
 def fetch_symbol_bundle(symbol: str) -> Dict[str, Optional[pd.DataFrame]]:
     """
-    Fetch all timeframes needed for a single symbol's full signal matrix.
+    Fetch all timeframes for a single symbol.
     
-    Args:
-        symbol: Trading pair (e.g., "BTC/USDT")
-    
-    Returns:
-        Dictionary with timeframe keys and DataFrame values
+    Returns a dict with timeframe keys and DataFrame values.
     """
     frames = {}
     for tf, limit in [
-        ("15m", 300), 
-        ("30m", 300), 
+        ("15m", 300),
+        ("30m", 300),
         ("1h", 300),
-        ("4h", 300), 
-        ("1d", 400), 
+        ("4h", 300),
+        ("1d", 400),
         ("1w", 260),
     ]:
         frames[tf] = fetch_ohlcv(symbol, tf, limit)
     return frames
 
 
-def fetch_bundles_threaded(symbols: List[str], max_workers: int = 16) -> Dict[str, Dict]:
+def fetch_bundles_threaded(symbols: List[str], max_workers: int = 8) -> Dict[str, Dict]:
     """
     Fetch all timeframes for multiple symbols using thread pooling.
-    Optimized for parallel execution with configurable worker count.
     
     Args:
-        symbols: List of trading pairs
+        symbols: List of internal symbol names
         max_workers: Maximum number of concurrent threads
     
     Returns:
-        Dictionary mapping symbols to their timeframe data
+        Dictionary mapping symbol -> {timeframe: DataFrame}
     """
     results = {}
-    
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
         futures = {executor.submit(fetch_symbol_bundle, sym): sym for sym in symbols}
@@ -187,66 +186,46 @@ def fetch_bundles_threaded(symbols: List[str], max_workers: int = 16) -> Dict[st
         for fut in as_completed(futures):
             sym = futures[fut]
             try:
-                results[sym] = fut.result(timeout=30)  # 30 second timeout per symbol
-            except Exception as e:
-                # Log error but continue with other symbols
+                results[sym] = fut.result(timeout=45)
+            except Exception:
+                # On failure, store an empty dict so the symbol is skipped
                 results[sym] = {}
     
     return results
 
 
-def fetch_bundles_batched(symbols: List[str], batch_size: int = 200, max_workers: int = 16) -> Dict[str, Dict]:
+def fetch_bundles_batched(
+    symbols: List[str], 
+    batch_size: int = 200, 
+    max_workers: int = 8
+) -> Dict[str, Dict]:
     """
-    Fetch bundles in batches to handle very large symbol lists (500+).
-    Prevents timeout and memory issues with large datasets.
+    Fetch bundles in batches to handle large lists (kept for compatibility).
     
     Args:
-        symbols: List of trading pairs
-        batch_size: Number of symbols to process per batch
-        max_workers: Maximum number of concurrent threads per batch
+        symbols: List of internal symbol names
+        batch_size: Number of symbols per batch (not critical for 10)
+        max_workers: Maximum threads per batch
     
     Returns:
-        Dictionary mapping symbols to their timeframe data
+        Dictionary mapping symbol -> {timeframe: DataFrame}
     """
     results = {}
-    total_batches = (len(symbols) + batch_size - 1) // batch_size
-    
-    # Show progress for large batches
-    if total_batches > 1:
-        st.info(f"📊 Processing {len(symbols)} symbols in {total_batches} batches...")
-    
     for i in range(0, len(symbols), batch_size):
-        batch = symbols[i:i + batch_size]
-        batch_num = (i // batch_size) + 1
-        
-        # Show progress for each batch
-        if total_batches > 1:
-            st.text(f"Processing batch {batch_num}/{total_batches} ({len(batch)} symbols)...")
-        
+        batch = symbols[i:i+batch_size]
         batch_results = fetch_bundles_threaded(batch, max_workers)
         results.update(batch_results)
-        
-        # Small delay between batches to avoid rate limiting
-        if i + batch_size < len(symbols):
-            time.sleep(0.5)
-    
     return results
 
 
-def get_market_coverage(symbols: List[str]) -> Dict[str, any]:
-    """
-    Get market coverage statistics for the current symbol set.
-    
-    Args:
-        symbols: List of trading pairs
-    
-    Returns:
-        Dictionary with coverage statistics
-    """
-    total_futures_pairs = 500  # Approximate total USDT pairs on Binance Futures
-    
-    return {
-        "total_symbols": len(symbols),
-        "market_coverage_pct": (len(symbols) / total_futures_pairs) * 100,
-        "estimated_pairs": total_futures_pairs
-    }
+# ============================================================================
+# LEGACY FUNCTIONS REMOVED (no longer needed)
+# ============================================================================
+# The following functions from the old Binance feed are removed:
+# - fetch_all_tickers()
+# - get_top_symbols_by_volume()
+# - normalize_symbol()
+# - is_excluded()
+# - get_exchange()
+#
+# They are no longer used because we now use a fixed symbol list.

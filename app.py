@@ -16,11 +16,11 @@ import plotly.graph_objects as go
 import streamlit as st
 from supabase import create_client, Client
 
+# Yahoo Finance data feed (no Binance ticker/volume functions)
 from data_feed import (
-    fetch_all_tickers, 
-    fetch_bundles_threaded, 
+    fetch_bundles_threaded,
     fetch_bundles_batched,
-    get_top_symbols_by_volume
+    fetch_ohlcv,          # still used for deep-dive chart
 )
 from indicators import (
     ZONE_COLORS, SIGNAL_COLORS, composite_oracle, gmma_signal, pivot_zone,
@@ -35,6 +35,22 @@ except Exception:
 
 APP_DIR = Path(__file__).parent
 LOGO_PATH = APP_DIR / "assets" / "hvts_logo.png"
+
+# ============================================================================
+# FIXED SYMBOL LIST – NO BINANCE TICKER SCANNING
+# ============================================================================
+INITIAL_SYMBOLS = [
+    "BTC/USDT",      # Bitcoin - Primary
+    "ETH/USDT",      # Ethereum - Primary
+    "TRX/USDT",      # Tron
+    "XRP/USDT",      # Ripple
+    "ADA/USDT",      # Cardano
+    "DOGE/USDT",     # Dogecoin
+    "POL/USDT",      # Polygon (formerly MATIC)
+    "DOT/USDT",      # Polkadot
+    "AVAX/USDT",     # Avalanche
+    "BNB/USDT",      # Binance Coin
+]
 
 # ============================================================================
 # PAGE CONFIG
@@ -180,36 +196,15 @@ section[data-testid="stSidebar"] {{ background: {SURFACE}; border-right: 1px sol
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# SIDEBAR CONTROLS
+# SIDEBAR CONTROLS (simplified)
 # ============================================================================
 with st.sidebar:
     if LOGO_PATH.exists():
         st.image(str(LOGO_PATH), width=64)
     st.markdown("### HVTS.AI Studio")
-    st.caption("Binance Futures · Signal Control Room")
+    st.caption("Fixed universe – 10 top crypto pairs")
     st.markdown("---")
 
-    st.markdown("**Universe**")
-    universe_mode = st.radio(
-        "Symbol source", ["Top by 24h Volume", "Custom Watchlist"],
-        label_visibility="collapsed",
-    )
-    if universe_mode == "Top by 24h Volume":
-        top_n = st.slider("Number of symbols", 10, 500, 100, step=10, 
-                          help="Scan top N symbols by 24h volume. Max 500 symbols supported.")
-        custom_symbols = None
-    else:
-        default_watchlist = "BTC/USDT, ETH/USDT, SOL/USDT, BNB/USDT, XRP/USDT, DOGE/USDT"
-        raw = st.text_area("Symbols (comma-separated)", value=default_watchlist, height=80)
-        custom_symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
-        top_n = None
-
-    min_volume = st.number_input(
-        "Min 24h volume (USDT)", min_value=0, value=1_000_000, step=100_000, format="%d",
-        help="Filter out low-volume pairs to improve performance"
-    )
-
-    st.markdown("---")
     st.markdown("**Refresh**")
     auto_refresh = st.toggle("Auto-refresh", value=True)
     refresh_secs = st.select_slider(
@@ -229,7 +224,6 @@ if auto_refresh and HAS_AUTOREFRESH:
     st_autorefresh(interval=refresh_secs * 1000, key="hvts_autorefresh")
 
 if force_refresh:
-    fetch_all_tickers.clear()
     st.cache_data.clear()
 
 # ============================================================================
@@ -237,15 +231,12 @@ if force_refresh:
 # ============================================================================
 @st.cache_resource
 def get_supabase_client() -> Client | None:
-    """Initialize Supabase client using secrets or environment variables."""
-    # Try Streamlit secrets first, then environment variables
     try:
         url = st.secrets["SUPABASE_URL"]
         key = st.secrets["SUPABASE_KEY"]
     except Exception:
         url = os.getenv("SUPABASE_URL")
         key = os.getenv("SUPABASE_KEY")
-    
     if not url or not key:
         return None
     return create_client(url, key)
@@ -264,7 +255,7 @@ header_html = (
 f'{logo_html}'
 '<div class="hvts-title-wrap">'
 '<p class="hvts-title">HVTS.AI STUDIO</p>'
-'<p class="hvts-subtitle">BINANCE FUTURES · MULTI-TIMEFRAME SIGNAL INTELLIGENCE FOR DAY · SWING · POSITION TRADING</p>'
+'<p class="hvts-subtitle">FIXED UNIVERSE · 10 TOP CRYPTO PAIRS · MULTI‑TIMEFRAME SIGNAL INTELLIGENCE</p>'
 '</div>'
 f'<div class="hvts-live-pill"><span class="hvts-dot"></span>LIVE · {now.strftime("%H:%M:%S")}</div>'
 '</div>'
@@ -272,39 +263,32 @@ f'<div class="hvts-live-pill"><span class="hvts-dot"></span>LIVE · {now.strftim
 st.markdown(header_html, unsafe_allow_html=True)
 
 # ============================================================================
-# DATA PIPELINE
+# DATA PIPELINE (using fixed symbols, no ticker fetching)
 # ============================================================================
 @st.cache_data(ttl=280, show_spinner=False)
-def build_master_table(symbols: tuple, min_volume: float) -> pd.DataFrame:
-    tickers = fetch_all_tickers()
-    if not tickers:
-        return pd.DataFrame()
-
-    ticker_lookup = {}
-    for raw_sym, data in tickers.items():
-        norm = raw_sym[:-5] if raw_sym.endswith(":USDT") else raw_sym
-        ticker_lookup[norm] = data
-
-    # Use batching for large symbol sets to avoid timeouts
-    if len(symbols) > 200:
-        bundles = fetch_bundles_batched(list(symbols), batch_size=200, max_workers=16)
-    else:
-        bundles = fetch_bundles_threaded(list(symbols), max_workers=16)
+def build_master_table(symbols: tuple) -> pd.DataFrame:
+    """
+    Builds the master signal table for the fixed list of symbols.
+    No Binance ticker/volume checks – just fetches OHLCV bundles.
+    """
+    # Use threaded fetching for our 10 symbols
+    bundles = fetch_bundles_threaded(list(symbols), max_workers=8)
 
     rows = []
     for sym in symbols:
-        tdata = ticker_lookup.get(sym, {})
-        price = tdata.get("last") or tdata.get("mark") or 0
-        volume = tdata.get("quoteVolume", 0) or 0
-        if not price or volume < min_volume:
-            continue
-
         frames = bundles.get(sym, {})
         f15, f30, f1h, f4h, f1d, f1w = (
             frames.get("15m"), frames.get("30m"), frames.get("1h"),
             frames.get("4h"), frames.get("1d"), frames.get("1w"),
         )
         if f1d is None or f1h is None:
+            # Skip if essential timeframes are missing
+            continue
+
+        # Price and volume from 1h candle
+        price = float(f1h["close"].iloc[-1]) if f1h is not None else 0
+        volume = float(f1h["volume"].iloc[-1]) if f1h is not None else 0
+        if price == 0:
             continue
 
         ath = float(f1d["high"].max()) if f1d is not None and len(f1d) else price
@@ -319,7 +303,7 @@ def build_master_table(symbols: tuple, min_volume: float) -> pd.DataFrame:
         swing_o = composite_oracle(f1h, f4h, fib_lb_fast=24, fib_lb_slow=20, poly_lb_fast=40, poly_lb_slow=30) if f1h is not None and f4h is not None else None
         pos_o = composite_oracle(f1d, f1w, fib_lb_fast=30, fib_lb_slow=20, poly_lb_fast=40, poly_lb_slow=24) if f1d is not None and f1w is not None else None
 
-        # --- Advanced indicators (H4) ---
+        # Advanced indicators (H4)
         macd_h4 = macd(f4h) if f4h is not None else "neutral"
         williams_h4 = williams_r(f4h) if f4h is not None else "neutral"
         crt_h4 = crt(f4h) if f4h is not None else "neutral"
@@ -329,10 +313,8 @@ def build_master_table(symbols: tuple, min_volume: float) -> pd.DataFrame:
 
         def sc(o):
             return o.net_score if o else 0.0
-
         def sig(o):
             return o.signal if o else "NEUTRAL"
-
         def conf(o):
             return o.confidence if o else 0.0
 
@@ -347,7 +329,6 @@ def build_master_table(symbols: tuple, min_volume: float) -> pd.DataFrame:
             "Day_Signal": sig(day_o), "Day_Score": sc(day_o), "Day_Conf": conf(day_o),
             "Swing_Signal": sig(swing_o), "Swing_Score": sc(swing_o), "Swing_Conf": conf(swing_o),
             "Position_Signal": sig(pos_o), "Position_Score": sc(pos_o), "Position_Conf": conf(pos_o),
-            # Advanced indicators
             "MACD_H4": macd_h4,
             "WilliamsR_H4": williams_h4,
             "CRT_H4": crt_h4,
@@ -390,26 +371,13 @@ def action_call(row) -> str:
     return "⚪ Stand aside"
 
 
-with st.spinner("Scanning Binance Futures market..."):
-    tickers_preview = fetch_all_tickers()
-    if universe_mode == "Top by 24h Volume":
-        symbols = get_top_symbols_by_volume(tickers_preview, min_volume, top_n) if tickers_preview else []
-    else:
-        symbols = custom_symbols or []
-
-    if symbols:
-        total_symbols = len(symbols)
-        if total_symbols > 200:
-            st.info(f"🔍 Scanning {total_symbols} symbols in batches. This may take 30-60 seconds for large scans.")
-        
-        df = build_master_table(tuple(symbols), float(min_volume)) if symbols else pd.DataFrame()
-    else:
-        df = pd.DataFrame()
+with st.spinner("Loading data for fixed symbol universe..."):
+    df = build_master_table(tuple(INITIAL_SYMBOLS)) if INITIAL_SYMBOLS else pd.DataFrame()
 
 if df.empty:
     st.warning(
-        "No symbols matched your filters yet, or the market data feed is still warming up. "
-        "Try lowering the minimum volume, choosing more symbols, or clicking **Refresh now**."
+        "No data could be fetched for the fixed symbols. "
+        "Please check your internet connection or the availability of OHLCV data for these pairs."
     )
     st.stop()
 
@@ -418,22 +386,21 @@ df["Action"] = df.apply(action_call, axis=1)
 df = df.sort_values("HVTS_Score", ascending=False).reset_index(drop=True)
 
 # ============================================================================
-# KPI STRIP
+# KPI STRIP (updated for fixed universe)
 # ============================================================================
 total_syms = len(df)
 strong_bull = int((df["HVTS_Score"] >= 0.5).sum())
 strong_bear = int((df["HVTS_Score"] <= -0.5).sum())
 deep_value = int(df["Zone"].isin(["Accumulation Zone", "Extreme Discount"]).sum())
 avg_conf = df[["Day_Conf", "Swing_Conf", "Position_Conf"]].mean().mean()
-market_coverage = (total_syms / 500) * 100 if total_syms > 0 else 0
 
 kpis = [
-    ("Symbols Scanned", f"{total_syms}", CYAN),
+    ("Symbols Analysed", f"{total_syms}", CYAN),
     ("Strong Bullish", f"{strong_bull}", GREEN),
     ("Strong Bearish", f"{strong_bear}", RED),
     ("Deep-Value Zone", f"{deep_value}", GOLD),
     ("Avg Confidence", f"{avg_conf:.0f}%", PURPLE),
-    ("Market Coverage", f"{market_coverage:.0f}%", CYAN),
+    ("Universe", "Fixed 10", CYAN),
 ]
 cards_html = '<div class="kpi-row">'
 for label, value, color in kpis:
@@ -448,14 +415,14 @@ cards_html += "</div>"
 st.markdown(cards_html, unsafe_allow_html=True)
 
 st.markdown(
-    f'<p class="hvts-caption">Last scan {now.strftime("%Y-%m-%d %H:%M:%S")}'
+    f'<p class="hvts-caption">Last updated {now.strftime("%Y-%m-%d %H:%M:%S")}'
     + (f" · next auto-refresh ~{next_refresh.strftime('%H:%M:%S')}" if auto_refresh else " · auto-refresh paused")
-    + f" · universe: {universe_mode} · style emphasis: {style_focus}</p>",
+    + f" · style emphasis: {style_focus}</p>",
     unsafe_allow_html=True,
 )
 
 # ============================================================================
-# STYLING HELPERS FOR TABLES
+# STYLING HELPERS
 # ============================================================================
 def style_signal_col(val):
     color = SIGNAL_COLORS.get(val, TEXT_DIM)
@@ -482,7 +449,6 @@ def style_action_col(val):
     return f"color:{TEXT_DIM};"
 
 def style_advanced_signal_col(val):
-    """Style for advanced indicator signals (MACD, Williams, CRT, SMC, VWAP)."""
     if val in ["bullish", "oversold_bullish"]:
         return f"color:{GREEN}; font-weight:600;"
     elif val in ["bearish", "overbought_bearish"]:
@@ -604,7 +570,6 @@ with tab_deep:
                            paper_bgcolor="rgba(0,0,0,0)", font_color=TEXT)
         gcol.plotly_chart(fig, use_container_width=True)
 
-    # Advanced indicators summary
     st.markdown("#### Advanced Indicators (H4)")
     adv_cols = st.columns(6)
     adv_cols[0].metric("MACD", row["MACD_H4"].upper())
@@ -614,8 +579,7 @@ with tab_deep:
     adv_cols[4].metric("VWAP", row["VWAP_H4"].upper())
     adv_cols[5].metric("RVOL", f"{row['RVOL_H4']:.2f}x")
 
-    # Candlestick with GMMA + ATH zone bands
-    from data_feed import fetch_ohlcv
+    # Candlestick chart – uses Yahoo Finance via fetch_ohlcv
     chart_tf = st.select_slider("Chart timeframe", options=["15m", "1h", "4h", "1d"], value="4h")
     cdf = fetch_ohlcv(sel_symbol, chart_tf, 300)
     if cdf is not None:
@@ -667,7 +631,7 @@ with tab_advanced:
     st.dataframe(styler, use_container_width=True, height=560, hide_index=True)
 
 # ============================================================================
-# BITCOIN AI SIGNAL TAB (NEW)
+# BITCOIN AI SIGNAL TAB (Supabase integration – unchanged)
 # ============================================================================
 with tab_btc_ai:
     st.markdown('<div class="hvts-section-title"><span class="bar"></span>🧠 Real‑time Neural Network Signal for Bitcoin</div>', unsafe_allow_html=True)
@@ -805,7 +769,7 @@ with tab_btc_ai:
 # ============================================================================
 st.markdown(
     f'<p class="hvts-caption" style="text-align:center; margin-top:24px;">'
-    f"HVTS.AI Studio · Public Binance Futures market data only, no API keys required · "
+    f"HVTS.AI Studio · Free Yahoo Finance data · "
     f"Signals are analytical output, not financial advice.</p>",
     unsafe_allow_html=True,
 )
