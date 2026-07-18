@@ -16,7 +16,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from supabase import create_client, Client
 
-# Yahoo Finance data feed (no Binance ticker/volume functions)
+# Binance Public API data feed (no ticker/volume functions)
 from data_feed import (
     fetch_bundles_threaded,
     fetch_bundles_batched,
@@ -46,6 +46,7 @@ INITIAL_SYMBOLS = [
     "XRP/USDT",      # Ripple
     "ADA/USDT",      # Cardano
     "DOGE/USDT",     # Dogecoin
+    "POL/USDT",      # Polygon (formerly MATIC)
     "DOT/USDT",      # Polkadot
     "AVAX/USDT",     # Avalanche
     "BNB/USDT",      # Binance Coin
@@ -578,7 +579,7 @@ with tab_deep:
     adv_cols[4].metric("VWAP", row["VWAP_H4"].upper())
     adv_cols[5].metric("RVOL", f"{row['RVOL_H4']:.2f}x")
 
-    # Candlestick chart – uses Yahoo Finance via fetch_ohlcv
+    # Candlestick chart – uses Binance public API via fetch_ohlcv
     chart_tf = st.select_slider("Chart timeframe", options=["15m", "1h", "4h", "1d"], value="4h")
     cdf = fetch_ohlcv(sel_symbol, chart_tf, 300)
     if cdf is not None:
@@ -768,7 +769,7 @@ with tab_btc_ai:
 # ============================================================================
 st.markdown(
     f'<p class="hvts-caption" style="text-align:center; margin-top:24px;">'
-    f"HVTS.AI Studio · Free Yahoo Finance data · "
+    f"HVTS.AI Studio · Free Binance public data · "
     f"Signals are analytical output, not financial advice.</p>",
     unsafe_allow_html=True,
 )
