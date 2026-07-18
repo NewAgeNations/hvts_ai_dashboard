@@ -46,7 +46,6 @@ INITIAL_SYMBOLS = [
     "XRP/USDT",      # Ripple
     "ADA/USDT",      # Cardano
     "DOGE/USDT",     # Dogecoin
-    "POL/USDT",      # Polygon (formerly MATIC)
     "DOT/USDT",      # Polkadot
     "AVAX/USDT",     # Avalanche
     "BNB/USDT",      # Binance Coin
