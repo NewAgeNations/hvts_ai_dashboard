@@ -1,5 +1,5 @@
 """
-HVTS.AI Studio - Binance Futures Multi-Timeframe Signal Dashboard
+HVTS.AI Studio - Gate.io Multi-Timeframe Signal Dashboard
 ==================================================================
 Run:  streamlit run app.py
 """
@@ -16,7 +16,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from supabase import create_client, Client
 
-# Binance Public API data feed (no ticker/volume functions)
+# Gate.io Public API data feed (no ticker/volume functions)
 from data_feed import (
     fetch_bundles_threaded,
     fetch_bundles_batched,
@@ -40,7 +40,7 @@ _LOGO_CANDIDATES = [APP_DIR / "assets" / "hvts_logo.png", APP_DIR / "hvts_logo.p
 LOGO_PATH = next((p for p in _LOGO_CANDIDATES if p.exists()), _LOGO_CANDIDATES[0])
 
 # ============================================================================
-# FIXED SYMBOL LIST – NO BINANCE TICKER SCANNING
+# FIXED SYMBOL LIST – NO EXCHANGE TICKER SCANNING
 # ============================================================================
 INITIAL_SYMBOLS = [
     "BTC/USDT",      # Bitcoin - Primary
@@ -272,7 +272,7 @@ st.markdown(header_html, unsafe_allow_html=True)
 def build_master_table(symbols: tuple) -> pd.DataFrame:
     """
     Builds the master signal table for the fixed list of symbols.
-    No Binance ticker/volume checks – just fetches OHLCV bundles.
+    No Gate.io ticker/volume checks – just fetches OHLCV bundles.
     """
     # Use threaded fetching for our 10 symbols
     bundles = fetch_bundles_threaded(list(symbols), max_workers=8)
@@ -385,20 +385,16 @@ if df.empty:
 
     ok, detail = test_connection()
     if ok:
-        st.info("Connectivity check: reached Binance's public API successfully (ping OK). "
+        st.info("Connectivity check: reached Gate.io's public API successfully (ping OK). "
                  "The failure is happening per-symbol — see the errors below.")
     else:
-        st.error(f"Connectivity check to Binance failed: **{detail}**")
+        st.error(f"Connectivity check to Gate.io failed: **{detail}**")
         if "403" in detail or "451" in detail:
             st.markdown(
-                "An HTTP 403/451 from Binance almost always means Binance's own "
-                "servers are rejecting requests **from this host's IP/region** — "
-                "not a bug in this code. This is common when the app is deployed on "
-                "cloud platforms (Streamlit Community Cloud, AWS, GCP, etc.), since "
-                "Binance blocks many datacenter IP ranges for its public market-data "
-                "API. Retrying won't fix this; you'd need to either run the app from "
-                "an unblocked network/host, or switch the data source (e.g. Binance's "
-                "`data-api.binance.vision` mirror, or another exchange's public API)."
+                "An HTTP 403/451 means the exchange's own servers are rejecting "
+                "requests **from this host's IP/region** — not a bug in this code. "
+                "Retrying won't fix this; you'd need to either run the app from a "
+                "different network/host, or switch to another exchange's public API."
             )
 
     errors = get_last_errors()
@@ -607,7 +603,7 @@ with tab_deep:
     adv_cols[4].metric("VWAP", row["VWAP_H4"].upper())
     adv_cols[5].metric("RVOL", f"{row['RVOL_H4']:.2f}x")
 
-    # Candlestick chart – uses Binance public API via fetch_ohlcv
+    # Candlestick chart – uses Gate.io public API via fetch_ohlcv
     chart_tf = st.select_slider("Chart timeframe", options=["15m", "1h", "4h", "1d"], value="4h")
     cdf = fetch_ohlcv(sel_symbol, chart_tf, 300)
     if cdf is not None:
@@ -797,7 +793,7 @@ with tab_btc_ai:
 # ============================================================================
 st.markdown(
     f'<p class="hvts-caption" style="text-align:center; margin-top:24px;">'
-    f"HVTS.AI Studio · Free Binance public data · "
+    f"HVTS.AI Studio · Free Gate.io public data · "
     f"Signals are analytical output, not financial advice.</p>",
     unsafe_allow_html=True,
 )

@@ -1,8 +1,13 @@
 """
-HVTS.AI Studio - Public Data Feed (Binance)
+HVTS.AI Studio - Public Data Feed (Gate.io)
 ============================================
-Free, no‑API‑key OHLCV data from Binance public API.
+Free, no-API-key OHLCV data from Gate.io's public spot API.
 Uses only public endpoints (no authentication required).
+
+Switched from Binance -> Gate.io because Binance's public API returns
+HTTP 451 ("Service unavailable from a restricted location") for requests
+from many cloud-hosted IP ranges. Gate.io's public market-data endpoints
+do not apply that geo/IP restriction.
 """
 
 import pandas as pd
@@ -14,49 +19,48 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 # ============================================================================
-# SYMBOL MAPPING (Internal -> Binance Symbol)
+# SYMBOL MAPPING (Internal -> Gate.io currency pair)
 # ============================================================================
-# Binance uses format like "BTCUSDT" for spot markets
+# Gate.io uses underscore-separated pairs like "BTC_USDT" for spot markets
 SYMBOL_MAP = {
-    "BTC/USDT": "BTCUSDT",
-    "ETH/USDT": "ETHUSDT",
-    "TRX/USDT": "TRXUSDT",
-    "XRP/USDT": "XRPUSDT",
-    "ADA/USDT": "ADAUSDT",
-    "DOGE/USDT": "DOGEUSDT",
-    "POL/USDT": "POLUSDT",       # Binance supports POL
-    "DOT/USDT": "DOTUSDT",
-    "AVAX/USDT": "AVAXUSDT",
-    "BNB/USDT": "BNBUSDT",
+    "BTC/USDT": "BTC_USDT",
+    "ETH/USDT": "ETH_USDT",
+    "TRX/USDT": "TRX_USDT",
+    "XRP/USDT": "XRP_USDT",
+    "ADA/USDT": "ADA_USDT",
+    "DOGE/USDT": "DOGE_USDT",
+    "POL/USDT": "POL_USDT",      # Gate.io lists POL (formerly MATIC)
+    "DOT/USDT": "DOT_USDT",
+    "AVAX/USDT": "AVAX_USDT",
+    "BNB/USDT": "BNB_USDT",
 }
 
-# Binance interval mapping
-BINANCE_INTERVALS = {
+# Gate.io interval mapping. Gate.io has no native "1w" bucket - "7d" is the
+# closest supported interval and is used for the weekly timeframe.
+GATEIO_INTERVALS = {
     "15m": "15m",
     "30m": "30m",
     "1h": "1h",
     "4h": "4h",
     "1d": "1d",
-    "1w": "1w",
+    "1w": "7d",
 }
 
 # Permanently-invalid symbols only (bad symbol/timeframe mapping - not
 # transient network errors). We deliberately do NOT blacklist on network/HTTP
-# failures, since those are often transient (rate limit, geo-block, timeout)
-# and a symbol that failed once should still be retried on the next refresh.
+# failures, since those are often transient (rate limit, timeout) and a
+# symbol that failed once should still be retried on the next refresh.
 FAILED_SYMBOLS = set()
 
 # Diagnostics: last error seen per symbol, so the UI can explain *why* a
 # symbol returned no data instead of failing silently.
 LAST_ERROR: Dict[str, str] = {}
 
-# Rate limiting (Binance allows 1200 requests per minute)
+# Rate limiting (Gate.io's public endpoints are generously limited, but we
+# still space requests out to be a good citizen)
 LAST_REQUEST_TIME = 0
 REQUEST_DELAY = 0.1  # 100ms between requests
 
-# Binance's edge/WAF sometimes rejects requests that don't look like a normal
-# browser/client. A realistic UA won't bypass a real geo/IP block, but it
-# rules out the case where the default python-requests UA alone got flagged.
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -64,9 +68,11 @@ SESSION.headers.update({
     "Accept": "application/json",
 })
 
+GATEIO_BASE = "https://api.gateio.ws/api/v4"
+
 
 def _rate_limit():
-    """Ensure we don't exceed Binance's rate limits."""
+    """Space out requests a little."""
     global LAST_REQUEST_TIME
     elapsed = time.time() - LAST_REQUEST_TIME
     if elapsed < REQUEST_DELAY:
@@ -77,102 +83,80 @@ def _rate_limit():
 @st.cache_data(ttl=280, show_spinner=False)
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300) -> Optional[pd.DataFrame]:
     """
-    Fetch OHLCV data from Binance public API.
-    
+    Fetch OHLCV data from Gate.io's public spot API.
+
     Args:
         symbol: Internal symbol (e.g., 'BTC/USDT')
         timeframe: One of '15m', '30m', '1h', '4h', '1d', '1w'
-        limit: Number of candles to return (max 1000)
-    
+        limit: Number of candles to return (Gate.io caps at 1000)
+
     Returns:
         DataFrame with columns: open, high, low, close, volume
         Index: timestamp (datetime)
     """
-    # Check if this symbol is known to be permanently unmappable
     if symbol in FAILED_SYMBOLS:
         return None
-    
-    # Get Binance symbol
-    binance_symbol = SYMBOL_MAP.get(symbol)
-    if not binance_symbol:
+
+    gateio_symbol = SYMBOL_MAP.get(symbol)
+    if not gateio_symbol:
         FAILED_SYMBOLS.add(symbol)
         LAST_ERROR[symbol] = f"'{symbol}' has no entry in SYMBOL_MAP"
         return None
-    
-    # Get interval
-    interval = BINANCE_INTERVALS.get(timeframe)
+
+    interval = GATEIO_INTERVALS.get(timeframe)
     if not interval:
-        LAST_ERROR[symbol] = f"timeframe '{timeframe}' has no entry in BINANCE_INTERVALS"
+        LAST_ERROR[symbol] = f"timeframe '{timeframe}' has no entry in GATEIO_INTERVALS"
         return None
-    
-    # Build URL (using spot API)
-    url = "https://api.binance.com/api/v3/klines"
+
+    url = f"{GATEIO_BASE}/spot/candlesticks"
     params = {
-        "symbol": binance_symbol,
+        "currency_pair": gateio_symbol,
         "interval": interval,
         "limit": min(limit, 1000),
     }
-    
+
     try:
-        # Rate limit
         _rate_limit()
-        
-        # Make request (no API key needed)
         response = SESSION.get(url, params=params, timeout=10)
-        
+
         if response.status_code != 200:
-            # Surface *why* it failed instead of swallowing it. 451/403 from
-            # Binance almost always means the request originated from an IP
-            # / region Binance blocks (common on cloud hosts like Streamlit
-            # Community Cloud, AWS, GCP) - that's an infrastructure problem,
-            # not a code bug, and retrying won't fix it.
             try:
-                detail = response.json().get("msg", response.text[:200])
+                body = response.json()
+                detail = body.get("message", body.get("label", response.text[:200]))
             except Exception:
                 detail = response.text[:200]
             LAST_ERROR[symbol] = f"HTTP {response.status_code}: {detail}"
             return None
-        
+
         data = response.json()
-        
+
         if not data:
             LAST_ERROR[symbol] = "empty response body"
             return None
-        
-        # Binance returns: [timestamp, open, high, low, close, volume, ...]
+
+        # Gate.io candlestick row format:
+        # [timestamp(s), quote_volume, close, high, low, open, base_volume, closed?]
         df = pd.DataFrame(data, columns=[
-            "timestamp", "open", "high", "low", "close", "volume",
-            "close_time", "quote_asset_volume", "number_of_trades",
-            "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
-        ])
-        
-        # Convert types
-        df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="ms")
-        df["open"] = df["open"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
-        df["close"] = df["close"].astype(float)
-        df["volume"] = df["volume"].astype(float)
-        
-        # Keep only relevant columns
+            "timestamp", "quote_volume", "close", "high", "low", "open",
+            "volume", "closed"
+        ][:len(data[0])])
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"].astype(float).astype(int), unit="s")
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = df[col].astype(float)
+
         df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-        
-        # Set index
         df.set_index("timestamp", inplace=True)
-        
-        # Sort by timestamp (oldest first)
         df = df.sort_index()
-        
-        # Drop any NaN rows
         df = df.dropna()
-        
+
         if df.empty:
             LAST_ERROR[symbol] = "all rows dropped as NaN after parsing"
             return None
-        
+
         LAST_ERROR.pop(symbol, None)
         return df
-        
+
     except requests.exceptions.Timeout:
         LAST_ERROR[symbol] = "request timed out (10s)"
         return None
@@ -192,7 +176,7 @@ def get_last_errors() -> Dict[str, str]:
 def fetch_symbol_bundle(symbol: str) -> Dict[str, Optional[pd.DataFrame]]:
     """
     Fetch all timeframes for a single symbol.
-    
+
     Returns a dict with timeframe keys and DataFrame values.
     """
     frames = {}
@@ -211,46 +195,34 @@ def fetch_symbol_bundle(symbol: str) -> Dict[str, Optional[pd.DataFrame]]:
 def fetch_bundles_threaded(symbols: List[str], max_workers: int = 6) -> Dict[str, Dict]:
     """
     Fetch all timeframes for multiple symbols using thread pooling.
-    
+
     Args:
         symbols: List of internal symbol names
         max_workers: Maximum number of concurrent threads
-    
+
     Returns:
         Dictionary mapping symbol -> {timeframe: DataFrame}
     """
     results = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
         futures = {executor.submit(fetch_symbol_bundle, sym): sym for sym in symbols}
-        
-        # Process completed futures
         for fut in as_completed(futures):
             sym = futures[fut]
             try:
                 results[sym] = fut.result(timeout=30)
-            except Exception:
-                # On failure, store an empty dict so the symbol is skipped
+            except Exception as e:
+                LAST_ERROR[sym] = f"thread error: {type(e).__name__}: {e}"
                 results[sym] = {}
-    
     return results
 
 
 def fetch_bundles_batched(
-    symbols: List[str], 
-    batch_size: int = 200, 
+    symbols: List[str],
+    batch_size: int = 200,
     max_workers: int = 6
 ) -> Dict[str, Dict]:
     """
     Fetch bundles in batches to handle large lists (kept for compatibility).
-    
-    Args:
-        symbols: List of internal symbol names
-        batch_size: Number of symbols per batch
-        max_workers: Maximum threads per batch
-    
-    Returns:
-        Dictionary mapping symbol -> {timeframe: DataFrame}
     """
     results = {}
     for i in range(0, len(symbols), batch_size):
@@ -262,23 +234,17 @@ def fetch_bundles_batched(
 
 def test_connection() -> Tuple[bool, str]:
     """
-    Test if Binance's public API is reachable from this host.
+    Test if Gate.io's public API is reachable from this host.
 
-    Returns (ok, detail). detail explains *why* on failure - most commonly
-    this will be an HTTP 403/451 from Binance's own WAF/geo-block, which is
-    an infrastructure/hosting-location problem, not a bug in this app: many
-    cloud hosts (Streamlit Community Cloud, AWS, GCP, etc.) sit on IP ranges
-    Binance blocks for its public market-data API.
+    Returns (ok, detail).
     """
     try:
-        response = SESSION.get(
-            "https://api.binance.com/api/v3/ping",
-            timeout=10
-        )
+        response = SESSION.get(f"{GATEIO_BASE}/spot/time", timeout=10)
         if response.status_code == 200:
             return True, "OK"
         try:
-            detail = response.json().get("msg", response.text[:200])
+            body = response.json()
+            detail = body.get("message", body.get("label", response.text[:200]))
         except Exception:
             detail = response.text[:200]
         return False, f"HTTP {response.status_code}: {detail}"
@@ -288,14 +254,3 @@ def test_connection() -> Tuple[bool, str]:
         return False, f"connection error: {e}"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
-
-
-# ============================================================================
-# LEGACY FUNCTIONS REMOVED
-# ============================================================================
-# The following functions from the old feed are removed:
-# - fetch_all_tickers()
-# - get_top_symbols_by_volume()
-# - normalize_symbol()
-# - is_excluded()
-# - get_exchange()
