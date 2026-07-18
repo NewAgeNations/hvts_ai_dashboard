@@ -487,6 +487,31 @@ def style_rvol_col(val):
     else:
         return f"color:{TEXT_DIM};"
 
+def style_hvts_score_gradient(val):
+    """
+    Red -> yellow -> green diverging background for HVTS_Score in [-1, 1].
+    Hand-rolled instead of Styler.background_gradient() so this doesn't
+    depend on matplotlib being installed (pandas raises an ImportError at
+    render time if it's missing, which otherwise crashes the whole page).
+    """
+    try:
+        v = max(-1.0, min(1.0, float(val)))
+    except (TypeError, ValueError):
+        return ""
+    if v <= 0:
+        t = v + 1.0  # 0..1 across [-1, 0]
+        r1, g1, b1 = 215, 25, 28
+        r2, g2, b2 = 255, 255, 191
+    else:
+        t = v  # 0..1 across [0, 1]
+        r1, g1, b1 = 255, 255, 191
+        r2, g2, b2 = 26, 150, 65
+    r = int(r1 + (r2 - r1) * t)
+    g = int(g1 + (g2 - g1) * t)
+    b = int(b1 + (b2 - b1) * t)
+    text_color = "#0a0a0a" if (0.299 * r + 0.587 * g + 0.114 * b) > 150 else "#ffffff"
+    return f"background-color: rgb({r},{g},{b}); color:{text_color}; font-weight:700;"
+
 def base_table_style(styler):
     return (
         styler
@@ -548,7 +573,7 @@ with tab_matrix:
         .map(style_signal_col, subset=["Day", "Swing", "Position"]) \
         .map(style_gmma_col, subset=["GMMA_1H", "GMMA_4H", "GMMA_1D", "GMMA_1W"]) \
         .map(style_zone_col, subset=["Zone"]).map(style_action_col, subset=["Action"]) \
-        .background_gradient(subset=["HVTS_Score"], cmap="RdYlGn", vmin=-1, vmax=1)
+        .map(style_hvts_score_gradient, subset=["HVTS_Score"])
     st.dataframe(styler, use_container_width=True, height=620, hide_index=True)
     st.download_button(
         "⬇️ Export Full Matrix (CSV)",
