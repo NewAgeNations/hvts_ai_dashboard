@@ -5,6 +5,7 @@ Run:  streamlit run app.py
 """
 
 import base64
+import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,6 +14,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from supabase import create_client, Client
 
 from data_feed import (
     fetch_all_tickers, 
@@ -151,6 +153,29 @@ section[data-testid="stSidebar"] {{ background: {SURFACE}; border-right: 1px sol
 [data-testid="stDataFrame"] {{ border:1px solid {BORDER}; border-radius: 10px; overflow:hidden; }}
 
 .hvts-caption {{ color:{TEXT_DIM}; font-size:11.5px; margin-top: 2px; }}
+
+/* ---- Bitcoin AI Signal tab extra glow ---- */
+.btc-glow {{
+    text-shadow: 0 0 20px rgba(34,211,238,0.3);
+}}
+.btc-metric {{
+    background: linear-gradient(135deg, {SURFACE_2}, {SURFACE});
+    border: 1px solid {BORDER};
+    border-radius: 12px;
+    padding: 16px;
+    position: relative;
+    overflow: hidden;
+}}
+.btc-metric::before {{
+    content: '';
+    position: absolute;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: radial-gradient(circle at 30% 30%, rgba(34,211,238,0.05), transparent 60%);
+    pointer-events: none;
+}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -206,6 +231,26 @@ if auto_refresh and HAS_AUTOREFRESH:
 if force_refresh:
     fetch_all_tickers.clear()
     st.cache_data.clear()
+
+# ============================================================================
+# SUPABASE CLIENT (for Bitcoin AI Signal tab)
+# ============================================================================
+@st.cache_resource
+def get_supabase_client() -> Client | None:
+    """Initialize Supabase client using secrets or environment variables."""
+    # Try Streamlit secrets first, then environment variables
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+    except Exception:
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_KEY")
+    
+    if not url or not key:
+        return None
+    return create_client(url, key)
+
+supabase = get_supabase_client()
 
 # ============================================================================
 # HEADER
@@ -472,8 +517,8 @@ def base_table_style(styler):
 # ============================================================================
 # TABS
 # ============================================================================
-tab_day, tab_swing, tab_pos, tab_matrix, tab_deep, tab_advanced = st.tabs(
-    ["🔥 Day Trading", "📈 Swing Trading", "🧭 Position Trading", "🗂 Full Matrix", "🔍 Symbol Deep Dive", "📊 Advanced Signals"]
+tab_day, tab_swing, tab_pos, tab_matrix, tab_deep, tab_advanced, tab_btc_ai = st.tabs(
+    ["🔥 Day Trading", "📈 Swing Trading", "🧭 Position Trading", "🗂 Full Matrix", "🔍 Symbol Deep Dive", "📊 Advanced Signals", "🧠 Bitcoin AI Signal"]
 )
 
 with tab_day:
@@ -621,6 +666,143 @@ with tab_advanced:
         .map(style_action_col, subset=["Action"])
     st.dataframe(styler, use_container_width=True, height=560, hide_index=True)
 
+# ============================================================================
+# BITCOIN AI SIGNAL TAB (NEW)
+# ============================================================================
+with tab_btc_ai:
+    st.markdown('<div class="hvts-section-title"><span class="bar"></span>🧠 Real‑time Neural Network Signal for Bitcoin</div>', unsafe_allow_html=True)
+    
+    # Manual refresh for this tab
+    refresh_btc = st.button("🔄 Refresh Bitcoin Signal", use_container_width=False)
+    
+    # Fetch data from Supabase
+    @st.cache_data(ttl=60, show_spinner=False)
+    def fetch_btc_signals(limit: int = 20) -> pd.DataFrame:
+        if supabase is None:
+            return pd.DataFrame()
+        try:
+            # Get latest signals for BTC/USDT
+            response = supabase.table('neural_signals') \
+                .select('*') \
+                .eq('symbol', 'BTC/USDT') \
+                .order('created_at', desc=True) \
+                .limit(limit) \
+                .execute()
+            if response.data:
+                df = pd.DataFrame(response.data)
+                # Convert timestamps
+                df['created_at'] = pd.to_datetime(df['created_at'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                return df
+            return pd.DataFrame()
+        except Exception as e:
+            st.error(f"Error fetching from Supabase: {e}")
+            return pd.DataFrame()
+    
+    if refresh_btc:
+        st.cache_data.clear()
+    
+    btc_df = fetch_btc_signals(limit=10)  # Get latest 10 signals
+    
+    if btc_df.empty:
+        if supabase is None:
+            st.warning("⚠️ Supabase credentials not found. Please set SUPABASE_URL and SUPABASE_KEY in your environment or Streamlit secrets.")
+        else:
+            st.info("No Bitcoin AI signals found in the database yet. They will appear here as the neural network generates predictions.")
+    else:
+        # Get the latest signal
+        latest = btc_df.iloc[0]
+        
+        # ---- Metrics Row ----
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.markdown('<div class="btc-metric">', unsafe_allow_html=True)
+            st.metric("Trend", latest['trend_label'], delta=f"{latest['trend_confidence']*100:.1f}% confidence", delta_color="normal")
+            st.markdown('</div>', unsafe_allow_html=True)
+        with col2:
+            st.markdown('<div class="btc-metric">', unsafe_allow_html=True)
+            st.metric("Current Price", f"${latest['current_price']:,.2f}")
+            st.markdown('</div>', unsafe_allow_html=True)
+        with col3:
+            st.markdown('<div class="btc-metric">', unsafe_allow_html=True)
+            st.metric("Signal Strength", latest['signal_strength'].replace('_', ' ').title())
+            st.markdown('</div>', unsafe_allow_html=True)
+        with col4:
+            st.markdown('<div class="btc-metric">', unsafe_allow_html=True)
+            st.metric("Risk Level", latest['risk_level'].title())
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        # ---- Confidence Gauge ----
+        fig_gauge = go.Figure(go.Indicator(
+            mode = "gauge+number+delta",
+            value = latest['model_confidence'] * 100,
+            number = {"suffix": "%", "font": {"color": TEXT, "size": 32}},
+            title = {"text": "Model Confidence", "font": {"color": TEXT_DIM, "size": 16}},
+            delta = {"reference": 70, "increasing": {"color": GREEN}},
+            gauge = {
+                "axis": {"range": [0, 100], "tickcolor": TEXT_DIM},
+                "bar": {"color": CYAN},
+                "bgcolor": SURFACE,
+                "borderwidth": 0,
+                "steps": [
+                    {"range": [0, 30], "color": SURFACE_2},
+                    {"range": [30, 70], "color": "#1a2138"},
+                    {"range": [70, 100], "color": "#20283f"},
+                ],
+                "threshold": {
+                    "line": {"color": GOLD, "width": 4},
+                    "thickness": 0.75,
+                    "value": 70
+                }
+            }
+        ))
+        fig_gauge.update_layout(height=250, margin=dict(l=20, r=20, t=40, b=10),
+                                 paper_bgcolor="rgba(0,0,0,0)", font_color=TEXT)
+        st.plotly_chart(fig_gauge, use_container_width=True)
+        
+        # ---- Expected Returns & Targets ----
+        st.markdown("#### 📊 Expected Returns & Target Prices")
+        ret_cols = st.columns(3)
+        for i, hours in enumerate([1, 2, 3], start=1):
+            with ret_cols[i-1]:
+                ret = latest.get(f'expected_return_{hours}h', 0)
+                target = latest.get(f'target_price_{i}', None)
+                st.markdown(f"**{hours}H Step**")
+                st.metric("Expected Return", f"{ret*100:.2f}%")
+                if target:
+                    st.metric("Target Price", f"${target:,.2f}")
+                else:
+                    st.caption("No target set")
+        
+        # ---- Recent Signals Table ----
+        st.markdown("#### 📜 Recent Bitcoin Signals")
+        display_cols = ['created_at', 'trend_label', 'current_price', 'trend_confidence', 'model_confidence', 'signal_strength', 'risk_level']
+        recent_df = btc_df[display_cols].rename(columns={
+            'created_at': 'Time',
+            'trend_label': 'Trend',
+            'current_price': 'Price',
+            'trend_confidence': 'Trend Conf',
+            'model_confidence': 'Model Conf',
+            'signal_strength': 'Strength',
+            'risk_level': 'Risk'
+        })
+        # Format floats
+        recent_df['Price'] = recent_df['Price'].apply(lambda x: f"${x:,.2f}")
+        recent_df['Trend Conf'] = recent_df['Trend Conf'].apply(lambda x: f"{x*100:.1f}%")
+        recent_df['Model Conf'] = recent_df['Model Conf'].apply(lambda x: f"{x*100:.1f}%")
+        recent_df['Strength'] = recent_df['Strength'].str.replace('_', ' ').str.title()
+        
+        # Style the table
+        styled_recent = recent_df.style.set_properties(**{"background-color": SURFACE, "color": TEXT, "border-color": BORDER}) \
+            .set_table_styles([
+                {"selector": "th", "props": [("background-color", SURFACE_2), ("color", TEXT_DIM),
+                                              ("font-size", "11px"), ("text-transform", "uppercase")]}
+            ])
+        st.dataframe(styled_recent, use_container_width=True, height=300, hide_index=True)
+
+# ============================================================================
+# FOOTER
+# ============================================================================
 st.markdown(
     f'<p class="hvts-caption" style="text-align:center; margin-top:24px;">'
     f"HVTS.AI Studio · Public Binance Futures market data only, no API keys required · "

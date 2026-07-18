@@ -1,0 +1,49 @@
+@"
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+*.egg-info/
+*.egg
+dist/
+build/
+*.log
+
+# Environment variables & secrets (CRITICAL - don't upload these!)
+.env
+.env.local
+.env.*.local
+.streamlit/secrets.toml
+.streamlit/secrets.toml.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Data files
+*.csv
+*.xlsx
+*.parquet
+*.db
+*.sqlite
+
+# Cache
+.cache/
+*.cache
+.cursor/
+"@ | Out-File -FilePath ".gitignore" -Encoding utf8
