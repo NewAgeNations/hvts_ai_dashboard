@@ -11,7 +11,7 @@ import requests
 import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # ============================================================================
 # SYMBOL MAPPING (Internal -> Binance Symbol)
@@ -40,12 +40,29 @@ BINANCE_INTERVALS = {
     "1w": "1w",
 }
 
-# Cache for failed symbols to avoid repeated failed requests
+# Permanently-invalid symbols only (bad symbol/timeframe mapping - not
+# transient network errors). We deliberately do NOT blacklist on network/HTTP
+# failures, since those are often transient (rate limit, geo-block, timeout)
+# and a symbol that failed once should still be retried on the next refresh.
 FAILED_SYMBOLS = set()
+
+# Diagnostics: last error seen per symbol, so the UI can explain *why* a
+# symbol returned no data instead of failing silently.
+LAST_ERROR: Dict[str, str] = {}
 
 # Rate limiting (Binance allows 1200 requests per minute)
 LAST_REQUEST_TIME = 0
 REQUEST_DELAY = 0.1  # 100ms between requests
+
+# Binance's edge/WAF sometimes rejects requests that don't look like a normal
+# browser/client. A realistic UA won't bypass a real geo/IP block, but it
+# rules out the case where the default python-requests UA alone got flagged.
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json",
+})
 
 
 def _rate_limit():
@@ -71,7 +88,7 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300) -> Optional[pd.Da
         DataFrame with columns: open, high, low, close, volume
         Index: timestamp (datetime)
     """
-    # Check if this symbol is known to fail
+    # Check if this symbol is known to be permanently unmappable
     if symbol in FAILED_SYMBOLS:
         return None
     
@@ -79,12 +96,13 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300) -> Optional[pd.Da
     binance_symbol = SYMBOL_MAP.get(symbol)
     if not binance_symbol:
         FAILED_SYMBOLS.add(symbol)
+        LAST_ERROR[symbol] = f"'{symbol}' has no entry in SYMBOL_MAP"
         return None
     
     # Get interval
     interval = BINANCE_INTERVALS.get(timeframe)
     if not interval:
-        FAILED_SYMBOLS.add(symbol)
+        LAST_ERROR[symbol] = f"timeframe '{timeframe}' has no entry in BINANCE_INTERVALS"
         return None
     
     # Build URL (using spot API)
@@ -100,16 +118,25 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300) -> Optional[pd.Da
         _rate_limit()
         
         # Make request (no API key needed)
-        response = requests.get(url, params=params, timeout=10)
+        response = SESSION.get(url, params=params, timeout=10)
         
         if response.status_code != 200:
-            FAILED_SYMBOLS.add(symbol)
+            # Surface *why* it failed instead of swallowing it. 451/403 from
+            # Binance almost always means the request originated from an IP
+            # / region Binance blocks (common on cloud hosts like Streamlit
+            # Community Cloud, AWS, GCP) - that's an infrastructure problem,
+            # not a code bug, and retrying won't fix it.
+            try:
+                detail = response.json().get("msg", response.text[:200])
+            except Exception:
+                detail = response.text[:200]
+            LAST_ERROR[symbol] = f"HTTP {response.status_code}: {detail}"
             return None
         
         data = response.json()
         
         if not data:
-            FAILED_SYMBOLS.add(symbol)
+            LAST_ERROR[symbol] = "empty response body"
             return None
         
         # Binance returns: [timestamp, open, high, low, close, volume, ...]
@@ -140,14 +167,26 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300) -> Optional[pd.Da
         df = df.dropna()
         
         if df.empty:
-            FAILED_SYMBOLS.add(symbol)
+            LAST_ERROR[symbol] = "all rows dropped as NaN after parsing"
             return None
         
+        LAST_ERROR.pop(symbol, None)
         return df
         
-    except Exception as e:
-        FAILED_SYMBOLS.add(symbol)
+    except requests.exceptions.Timeout:
+        LAST_ERROR[symbol] = "request timed out (10s)"
         return None
+    except requests.exceptions.ConnectionError as e:
+        LAST_ERROR[symbol] = f"connection error: {e}"
+        return None
+    except Exception as e:
+        LAST_ERROR[symbol] = f"{type(e).__name__}: {e}"
+        return None
+
+
+def get_last_errors() -> Dict[str, str]:
+    """Return the most recent per-symbol fetch errors, for UI diagnostics."""
+    return dict(LAST_ERROR)
 
 
 def fetch_symbol_bundle(symbol: str) -> Dict[str, Optional[pd.DataFrame]]:
@@ -221,16 +260,34 @@ def fetch_bundles_batched(
     return results
 
 
-def test_connection() -> bool:
-    """Test if Binance API is accessible."""
+def test_connection() -> Tuple[bool, str]:
+    """
+    Test if Binance's public API is reachable from this host.
+
+    Returns (ok, detail). detail explains *why* on failure - most commonly
+    this will be an HTTP 403/451 from Binance's own WAF/geo-block, which is
+    an infrastructure/hosting-location problem, not a bug in this app: many
+    cloud hosts (Streamlit Community Cloud, AWS, GCP, etc.) sit on IP ranges
+    Binance blocks for its public market-data API.
+    """
     try:
-        response = requests.get(
+        response = SESSION.get(
             "https://api.binance.com/api/v3/ping",
             timeout=10
         )
-        return response.status_code == 200
-    except Exception:
-        return False
+        if response.status_code == 200:
+            return True, "OK"
+        try:
+            detail = response.json().get("msg", response.text[:200])
+        except Exception:
+            detail = response.text[:200]
+        return False, f"HTTP {response.status_code}: {detail}"
+    except requests.exceptions.Timeout:
+        return False, "request timed out (10s)"
+    except requests.exceptions.ConnectionError as e:
+        return False, f"connection error: {e}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 # ============================================================================

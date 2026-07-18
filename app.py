@@ -21,6 +21,8 @@ from data_feed import (
     fetch_bundles_threaded,
     fetch_bundles_batched,
     fetch_ohlcv,          # still used for deep-dive chart
+    test_connection,
+    get_last_errors,
 )
 from indicators import (
     ZONE_COLORS, SIGNAL_COLORS, composite_oracle, gmma_signal, pivot_zone,
@@ -34,7 +36,8 @@ except Exception:
     HAS_AUTOREFRESH = False
 
 APP_DIR = Path(__file__).parent
-LOGO_PATH = APP_DIR / "assets" / "hvts_logo.png"
+_LOGO_CANDIDATES = [APP_DIR / "assets" / "hvts_logo.png", APP_DIR / "hvts_logo.png"]
+LOGO_PATH = next((p for p in _LOGO_CANDIDATES if p.exists()), _LOGO_CANDIDATES[0])
 
 # ============================================================================
 # FIXED SYMBOL LIST – NO BINANCE TICKER SCANNING
@@ -379,6 +382,31 @@ if df.empty:
         "No data could be fetched for the fixed symbols. "
         "Please check your internet connection or the availability of OHLCV data for these pairs."
     )
+
+    ok, detail = test_connection()
+    if ok:
+        st.info("Connectivity check: reached Binance's public API successfully (ping OK). "
+                 "The failure is happening per-symbol — see the errors below.")
+    else:
+        st.error(f"Connectivity check to Binance failed: **{detail}**")
+        if "403" in detail or "451" in detail:
+            st.markdown(
+                "An HTTP 403/451 from Binance almost always means Binance's own "
+                "servers are rejecting requests **from this host's IP/region** — "
+                "not a bug in this code. This is common when the app is deployed on "
+                "cloud platforms (Streamlit Community Cloud, AWS, GCP, etc.), since "
+                "Binance blocks many datacenter IP ranges for its public market-data "
+                "API. Retrying won't fix this; you'd need to either run the app from "
+                "an unblocked network/host, or switch the data source (e.g. Binance's "
+                "`data-api.binance.vision` mirror, or another exchange's public API)."
+            )
+
+    errors = get_last_errors()
+    if errors:
+        with st.expander("Per-symbol error detail"):
+            for sym, err in errors.items():
+                st.code(f"{sym}: {err}")
+
     st.stop()
 
 df["HVTS_Score"] = df.apply(lambda r: composite_hvts_score(r, style_focus), axis=1)
